@@ -8,6 +8,7 @@ Usage: python mips_emulator.py [firmware.bin] [--trace] [--max N]
 
 import struct
 import sys
+import re
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -271,21 +272,48 @@ class Memory:
         if pa == UART0_TX and size <= 2:
             ch = val & 0xFF
             self.uart_output.append(ch)
+            if not hasattr(self, 'uart_history'): self.uart_history = []
+            self.uart_history.append(ch)
+            if len(self.uart_history) > 1024: self.uart_history = self.uart_history[-1024:]
             
             # Check if U-Boot just printed 'Hit any key to stop autoboot: '
             if ch == ord(':'):
-                out_str = bytes(self.uart_output[-30:]).decode('ascii', errors='ignore')
+                out_str = bytes(self.uart_history[-60:]).decode('ascii', errors='ignore')
                 if "autoboot" in out_str:
-                    if not hasattr(self, 'rx_queue'):
-                        self.rx_queue = list(b"\r\n\r\ngo 0x80000224\r\n")
+                    if getattr(self, 'bypass_autoboot', False):
+                        if not hasattr(self, 'rx_queue'):
+                            self.rx_queue = list(b"\r\n\r\ngo 0x80000224\r\n")
 
-            if ch == 0x0A or len(self.uart_output) > 256:
+            if ch == 0x0A or ch == 0x0D or True: # Force flush on every character for real-time trace
                 self._flush_uart()
+                
+            if ch == ord('\n'):
+                text = bytes(self.uart_history).decode('ascii', errors='ignore')
+                lines = text.replace('\r', '').split('\n')
+                if len(lines) >= 2:
+                    last_line = lines[-2].strip()
+                    m = re.search(r'spi_rdc\s+(0x[0-9A-Fa-f]+)\s+(0x[0-9A-Fa-f]+)\s+(0x[0-9A-Fa-f]+)', last_line)
+                    if m:
+                        try:
+                            dst = int(m.group(1), 16)
+                            src = int(m.group(2), 16)
+                            sz = int(m.group(3), 16)
+                            sys.stderr.write(f"\n[MAGIC] spi_rdc copy {hex(sz)} from ROM {hex(src)} to RAM {hex(dst)}\n")
+                            pa_dst = self._translate(dst)
+                            if 0 <= pa_dst < RAM_SIZE and 0 <= src < len(self.rom):
+                                self.ram[pa_dst:pa_dst+sz] = self.rom[src:src+sz]
+                        except Exception as e:
+                            sys.stderr.write(f"\n[MAGIC] spi_rdc error: {e}\n")
+
             return
 
         # Boot progress register
         if pa == BOOT_PROG:
             sys.stderr.write(f"[BOOT STAGE] {val}\n")
+
+        if 0x1F203100 <= pa <= 0x1F2031FC:
+            sys.stderr.write(f"[BDMA] pa=0x{pa:08x} val=0x{val:08x} size={size}\n")
+
 
         # Store all MMIO writes
         for i in range(size):
@@ -297,8 +325,8 @@ class Memory:
                 text = bytes(self.uart_output).decode('ascii', errors='replace')
             except:
                 text = ''.join(chr(c) if 32 <= c < 127 else '.' for c in self.uart_output)
-            sys.stdout.write(text)
-            sys.stdout.flush()
+            sys.stderr.write(text)
+            sys.stderr.flush()
             self.uart_output.clear()
 
     def load_rom(self, data):
@@ -311,9 +339,11 @@ class Memory:
 # ---------------------------------------------------------------------------
 
 class Emulator:
-    def __init__(self, rom_data, trace=False, max_insns=0):
+    def __init__(self, rom_data, trace=False, max_insns=0, bypass_autoboot=False):
         self.cpu = MipsCPU()
         self.mem = Memory()
+        self.bypass_autoboot = bypass_autoboot
+        self.mem.bypass_autoboot = bypass_autoboot
         self.mem.load_rom(rom_data)
         self.trace = trace
         self.max_insns = max_insns
@@ -385,6 +415,21 @@ class Emulator:
                 self.mem.write32(fp, end_dest)
                 self.mem.write32(fp + 4, src + length)
                 cpu.pc = 0x80252584
+                return
+
+        # Inject Fast-forward for memset loop (BSS clearing)
+        if pc == 0x80143820:
+            a0 = cpu.get_reg(4)
+            a3 = cpu.get_reg(7)
+            if a0 < a3:
+                pa_start = self.mem._translate(a0)
+                length = a3 - a0
+                if 0 < length < 100000000:
+                    sys.stderr.write(f"[HOOK] Fast-forwarding memset 0: dst={hex(a0)}, len={hex(length)}\n")
+                    # Set zeros directly
+                    self.mem.ram[pa_start:pa_start + length] = bytearray(length)
+                cpu.set_reg(4, a3)
+                cpu.pc = 0x8014384c # Jump to bne branch target fail path
                 return
 
         self.recent_pcs[self.recent_pcs_idx] = pc
@@ -531,6 +576,14 @@ class Emulator:
                 pass
             else:
                 self._unimplemented(pc, insn, f"R-type funct=0x{funct:02x}")
+
+        # ===== LWC1 (op=49, 0x31), LDC1 (op=53, 0x35) =====
+        elif op in (0x31, 0x35):
+            pass  # FPU load stubs
+
+        # ===== SWC1 (op=57, 0x39), SDC1 (op=61, 0x3d) =====
+        elif op in (0x39, 0x3d):
+            pass  # FPU store stubs
 
         # ===== REGIMM (op=1): BLTZ, BGEZ, BLTZAL, BGEZAL =====
         elif op == 0x01:
